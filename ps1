@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-import json
 import sys
+import json
 import os
 
-problems = json.load(sys.stdin)
+obj = input()
+problems = json.loads(obj)
 solutions = {}
 
 for problem in problems:
@@ -40,4 +41,4 @@ for problem in problems:
         solutions[problem] = solution_data
        
    
-json.dump(output_object,sys.stdout, indent=2)
+print(json.dumps(solutions))
