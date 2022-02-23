@@ -2,11 +2,8 @@
 import sys
 import json
 import os
-import ast
 
-obj = input()
-obj= ast.literal_eval(obj)
-problems = json.loads(obj)
+problems = json.load(sys.stdin)
 solutions = {}
 
 for problem in problems:
@@ -43,4 +40,4 @@ for problem in problems:
         solutions[problem] = solution_data
        
    
-print(json.dumps(solutions))
+json.dump(output_object,sys.stdout, indent=2)
