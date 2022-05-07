@@ -1,0 +1,241 @@
+#!/usr/bin/env python3
+import hashlib, hmac, binascii
+import json
+import sys
+import argparse
+import unicodedata
+from pathlib import Path
+import pathlib
+import codecs
+import getpass
+import os
+
+import sys
+import json
+from Crypto.Protocol.KDF import PBKDF2
+from Crypto.Hash import SHA256
+from Crypto.Random import get_random_bytes
+from Crypto.Cipher import AES
+
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+
+
+from Crypto.Util import Counter
+
+import functools
+
+def xor_bytes(*args: bytes) -> bytes:
+	"""
+	>>> xor(b'hello', b'world')
+	b'\x1f\n\x1e\x00\x0b'
+	>>> xor(b'hello', b'world', b'hello') # note it has >2 parameters
+	b'world'
+	>>> xor(xor(b'hello', b'world'), b'hello') # equivalent to above but longer :D
+	b'world'
+	"""
+	return bytes(functools.reduce(lambda a, b: a ^ b, i) for i in zip(*args))
+
+# takes in bytearray data and key  and returns unhexed encrypted
+def aes_ctr_encrypt_round(data, key):
+	left = data[:16]
+	right = data[16:]
+	zero_bytearray = b"\x00" * len(data)
+
+	cipher = Cipher(algorithm=algorithms.AES(key), mode=modes.CTR(left)).encryptor().update(zero_bytearray).hex()
+	right_xor = xor_bytes(bytearray.fromhex(cipher), right)
+
+	return left+right_xor
+
+# takes in bytearray data and key  and returns unhexed encrypted
+def hmac_encrypt_round(data, key):
+	left = data[:16]
+	right = data[16:]
+
+	hmac_sha256 = bytearray.fromhex(hmac.new(key, right, hashlib.sha256).hexdigest())
+
+	left_xor = xor_bytes(left, hmac_sha256)
+
+	return left_xor + right
+
+def encrypt(keys, plaintext):
+    round1 = aes_ctr_encrypt_round(plaintext, bytes.fromhex(keys[0]))
+    round2 = hmac_encrypt_round(round1, bytes.fromhex(keys[1]))
+    round3 = aes_ctr_encrypt_round(round2, bytes.fromhex(keys[2]))
+    round4 = hmac_encrypt_round(round3, bytes.fromhex(keys[3]))
+    return round4
+
+
+def decrypt(keys, ciphertext):
+    round1 = hmac_encrypt_round(ciphertext, bytes.fromhex(keys[3]))
+    round2 = aes_ctr_encrypt_round(round1, bytes.fromhex(keys[2]))
+    round3 = hmac_encrypt_round(round2, bytes.fromhex(keys[1]))
+    round4 = aes_ctr_encrypt_round(round3, bytes.fromhex(keys[0]))
+    return round4
+
+
+def mac(key, data):
+    return hmac.new(key, data, hashlib.sha256).hexdigest()
+
+def casefold_list(indexed_terms):
+    result = []
+    for indexed_term in indexed_terms:
+        result.append(unicodedata.normalize('NFC', indexed_term.casefold()))
+    return result
+
+def indexing_term(term):
+    result = []
+    for i in range(4, len(term)):
+        result.append(term[:i] + '*')
+    result.append(term)
+    return result
+
+def extract_search_terms(plaintext):
+	unicode_chars = ["Lu", "Ll", "Lt", "Lm", "Lo", "Mn", "Nd", "Pc"]
+	search_terms = []
+	term = ""
+
+	for char in plaintext:
+		if unicodedata.category(char) in unicode_chars:
+        	term += char
+        else:
+        	if len(term) >=4 and len(term)<=12 :
+        		indexed_terms = indexing_term(term)
+                casefolded_list = casefold_list(indexed_terms)
+                search_terms.extend(casefolded_list)
+            term = ""
+
+    return sorted(search_terms)
+
+
+def is_file_utf8_encoded(file):
+
+	try:
+	    f = codecs.open(filename, encoding='utf-8', errors='strict')
+	    for line in f:
+	        pass
+	    return True
+	except UnicodeDecodeError:
+	    return False
+
+def generate_all_keys(master_key):
+	master_key = bytearray.fromhex(master_key)
+    key = master_key[:16]
+    iv = master_key[16:]
+
+    zero_bytearray = b"\x00" * 16
+    zero_int = int.from_bytes(zero_bytearray, 'big')
+    iv_int = int.from_bytes(iv, 'big')
+
+    all_keys = {}
+
+    all_keys["validator"] = Cipher(algorithm=algorithms.AES(key), mode=modes.CTR(iv)).encryptor().update(zero_bytearray).hex()
+    all_keys["feistel"] = []
+    all_keys["feistel"].append(Cipher(algorithm=algorithms.AES(key), mode=modes.CTR((iv_int+1).to_bytes(len(iv), 'big'))).encryptor().update(zero_bytearray).hex())
+    all_keys["feistel"].append(Cipher(algorithm=algorithms.AES(key), mode=modes.CTR((iv_int+2).to_bytes(len(iv), 'big'))).encryptor().update(zero_bytearray).hex())
+    all_keys["feistel"].append(Cipher(algorithm=algorithms.AES(key), mode=modes.CTR((iv_int+3).to_bytes(len(iv), 'big'))).encryptor().update(zero_bytearray).hex())
+    all_keys["feistel"].append(Cipher(algorithm=algorithms.AES(key), mode=modes.CTR((iv_int+4).to_bytes(len(iv), 'big'))).encryptor().update(zero_bytearray).hex())
+    all_keys["mac"] = Cipher(algorithm=algorithms.AES(key), mode=modes.CTR((iv_int+5).to_bytes(len(iv), 'big'))).encryptor().update(zero_bytearray).hex()
+    all_keys["search_terms"] = Cipher(algorithm=algorithms.AES(key), mode=modes.CTR((iv_int+6).to_bytes(len(iv), 'big'))).encryptor().update(zero_bytearray).hex()
+
+    return all_keys
+
+def generate_masterkey(password, salt):
+
+	key = PBKDF2(password.encode('utf-8'), salt, 32, count=250000,  hmac_hash_module=SHA256 )
+
+	return key.hex()
+
+
+def get_password() -> str:
+    if sys.stdin.isatty():
+        return getpass.getpass("password: ")
+    else:
+        return sys.stdin.readline().strip()
+
+
+def validate_file(files, operation):
+	for file in files:
+		if not os.path.exists(file):
+			print("The file {} is not present".format(file))
+			sys.exit(1)
+		if os.path.getsize(file)<32:
+			print("The file {} size is less than 32".format(file))
+			sys.exit(1)
+
+		if operation == "Encrypt":
+			if os.path.exists('.fenc-meta.{}'.format(file)):
+				print("The file {} is already encrypted".format(file))
+				sys.exit(1)
+
+		if operation == "Decrypt":
+			if not os.path.exists('.fenc-meta.{}'.format(file)):
+				print("The file {} is unencrypted".format(file))
+				sys.exit(1)
+
+def handle_encryption(files, is_json):
+	validate_file(files,"Encrypt")
+	password = get_password()
+	master_keys = dict()
+	salts = dict()
+
+	for file in files:
+		salts[file] = os.urandom(16)
+		master_keys[file] = generate_masterkey(password, salts[file])
+
+	if is_json:
+        print(master_keys, file=sys.stdout)
+
+    for file in files:
+    	file_pointer = pathlib.Path(file)
+    	plaintext = file_pointer.read_bytes()
+
+    	all_keys = generate_all_keys(master_keys[file])
+
+    	search_terms = []
+    	search_terms_maced = []
+    	if is_file_utf8_encoded(file):
+    		search_terms = extract_search_terms(plaintext)
+    		for search_term in search_terms:
+    			search_terms_maced.append(mac(bytes.fromhex(all_keys["search_terms"]), search_term.encode('utf-8 ')))
+
+    	ciphertext = encrypt(all_keys["feistel"], plaintext)
+
+    	file_pointer.write_bytes(ciphertext)
+
+    	metadata = {}
+    	metadata_pointer = Path(".fenc-meta." + f)
+
+    	metadata["salt"] = salts[file].hex()
+    	metadata["validator"] = all_keys["validator"]
+    	metadata["mac"] = mac(bytes.fromhex(all_keys["mac"]), ciphertext)
+    	metadata["terms"] = list(dict.fromkeys(search_terms_maced))
+        metadata_pointer.write_text(json.dumps(metadata))
+
+
+		
+
+
+def main(args):
+	if args.search or args.decrypt:
+		args.encrypt = False
+
+	if args.encrypt:
+		handle_encryption(args.inputs, args.json)
+	elif args.decrypt:
+		pass
+		#handle_decryption(args.inputs, args.json)
+	elif args.search:
+		pass
+		#handle_search(args.inputs, args.json)
+
+
+if __name__ == '__main__':
+    argsParser = argparse.ArgumentParser()
+    argsParser.add_argument("inputs", nargs='*', help="enter filenames for -e or -d or search terms -s")
+    argsParser.add_argument("-j", "--json", action="store_true")
+    exclusiveGroup = argsParser.add_mutually_exclusive_group(required=False)
+    exclusiveGroup.add_argument('-e', '--encrypt', action="store_true", default=True)
+    exclusiveGroup.add_argument('-d', '--decrypt', action="store_true")
+    exclusiveGroup.add_argument('-s', '--search', action="store_true")
+    args = argsParser.parse_args()
+	main(args)
